@@ -27,7 +27,7 @@ use embassy_net_driver_channel::Device as D;
 use rand::RngCore;
 
 use heapless::String;
-use mx_meetup_lib::{parse_command, DemoDevice, DeviceState, PicoCommand};
+use mx_meetup_lib::{parse_command, DemoDevice, DemoDeviceBuilder, DeviceState, PicoCommand};
 use rust_mqtt::client::client::MqttClient;
 use rust_mqtt::client::client_config::ClientConfig;
 use rust_mqtt::packet::v5::reason_codes::ReasonCode;
@@ -35,8 +35,9 @@ use rust_mqtt::utils::rng_generator::CountingRng;
 use static_cell::StaticCell;
 use {defmt_rtt as _, panic_probe as _};
 
-const WIFI_NETWORK: &str = "ssid";
-const WIFI_PASSWORD: &str = "password";
+use mx_meetup_lib::temperature_sensor::{BuiltInTemperatureSensor, TemperatureSensor};
+
+
 
 bind_interrupts!(struct UsbIrqs {
     USBCTRL_IRQ => UsbInterruptHandler<USB>;
@@ -56,13 +57,7 @@ use embassy_sync::channel::{Channel as SyncChannel, Sender};
 static COMMAND_CHANNEL: SyncChannel<ThreadModeRawMutex, Result<PicoCommand, &'static str>, 64> =
     SyncChannel::new();
 
-fn convert_to_celsius(raw_temp: u16) -> f32 {
-    // According to chapter 4.9.5. Temperature Sensor in RP2040 datasheet
-    let temp = 27.0 - (raw_temp as f32 * 3.3 / 4096.0 - 0.706) / 0.001721;
-    let sign = if temp < 0.0 { -1.0 } else { 1.0 };
-    let rounded_temp_x10: i16 = ((temp * 10.0) + 0.5 * sign) as i16;
-    (rounded_temp_x10 as f32) / 10.0
-}
+
 
 #[embassy_executor::task]
 async fn command_task(mut receiver: Receiver<'static, Driver<'static, USB>>) {
@@ -113,10 +108,7 @@ async fn main(spawner: Spawner) {
     unwrap!(spawner.spawn(cyw43_task(runner)));
 
     control.init(clm).await;
-    control
-        .set_power_management(cyw43::PowerManagementMode::PowerSave)
-        .await;
-
+   
     let config = NetConfig::dhcpv4(Default::default());
 
     // Generate random seed
@@ -134,40 +126,14 @@ async fn main(spawner: Spawner) {
     static STACK: StaticCell<Stack<D<'static, 1514>>> = StaticCell::new();
     let static_stack = STACK.init(stack);
 
-    unwrap!(spawner.spawn(net_task(static_stack)));
-
-    loop {
-        match control.join_wpa2(WIFI_NETWORK, WIFI_PASSWORD).await {
-            Ok(_) => break,
-            Err(err) => {
-                info!("join failed with status={}", err.status);
-            }
-        }
-    }
-
-    // Wait for DHCP, not necessary when using static IP
-    info!("waiting for DHCP...");
-    while !static_stack.is_config_up() {
-        Timer::after_millis(100).await;
-    }
-    info!("DHCP is now up!");
-
-    info!("waiting for link up...");
-    while !static_stack.is_link_up() {
-        Timer::after_millis(500).await;
-    }
-    info!("Link is up!");
-
-    info!("waiting for stack to be up...");
-    static_stack.wait_config_up().await;
-    info!("Stack is up!");
+    
 
     // Create the driver, from the HAL.
     let driver = Driver::new(p.USB, UsbIrqs);
 
-    let mut adc = Adc::new(p.ADC, AdcIrqs, Config::default());
-
-    let mut ts = AdcChannel::new_temp_sensor(p.ADC_TEMP_SENSOR);
+    // Create the ADC and the temperature sensor channel.
+    let adc = Adc::new(p.ADC, AdcIrqs, Config::default());
+    let ts = AdcChannel::new_temp_sensor(p.ADC_TEMP_SENSOR);
 
     // Create embassy-usb Config
     let config = {
@@ -215,171 +181,112 @@ async fn main(spawner: Spawner) {
     // Build the builder.
     let usb = builder.build();
 
-    // loop for 30 iterations
-    for _ in 0..30 {
-        Timer::after_millis(100).await;
-        control.gpio_set(0, true).await;
-        Timer::after_millis(100).await;
-        control.gpio_set(0, false).await;
-    }
+    let (sender, receiver) = class.split();
 
+    // Run the network stack.
+    unwrap!(spawner.spawn(net_task(static_stack)));
     // Run the USB device.
     unwrap!(spawner.spawn(usb_task(usb)));
-
-    let (mut sender, receiver) = class.split();
+    // Run the command task.
     unwrap!(spawner.spawn(command_task(receiver)));
 
-    // loop for 30 iterations
-    for _ in 0..15 {
-        Timer::after_millis(100).await;
-        control.gpio_set(0, true).await;
-        Timer::after_millis(100).await;
-        control.gpio_set(0, false).await;
-    }
+    let command_receiver: embassy_sync::channel::Receiver<'_, ThreadModeRawMutex, Result<PicoCommand, &str>, 64> = COMMAND_CHANNEL.receiver();
 
-    let mut demo_device = DemoDevice::new(control);
+    let mut demo_device = DemoDeviceBuilder::new()
+        .with_stack(static_stack)
+        .with_command_receiver(command_receiver)
+        .with_usb_sender(sender)
+        .with_control(control)
+        .with_adc(adc, ts)
+        .build();
 
-    let mut rx_buffer = [0; 4096];
-    let mut tx_buffer = [0; 4096];
 
-    let mut socket = TcpSocket::new(static_stack, &mut rx_buffer, &mut tx_buffer);
+    // let mut rx_buffer = [0; 4096];
+    // let mut tx_buffer = [0; 4096];
 
-    socket.set_timeout(None);
+    // let mut socket = TcpSocket::new(static_stack, &mut rx_buffer, &mut tx_buffer);
 
-    let address = Ipv4Address::from_bytes(&[192, 168, 1, 89]);
-    let remote_endpoint = (address, 1883);
+    // socket.set_timeout(None);
 
-    let connection = socket.connect(remote_endpoint).await;
+    // let address = Ipv4Address::from_bytes(&[192, 168, 1, 89]);
+    // let remote_endpoint = (address, 1883);
 
-    if let Err(e) = connection {
-        info!("connect error: {:?}", e);
-    }
-    info!("connected!");
+    // let connection = socket.connect(remote_endpoint).await;
 
-    let mut config = ClientConfig::new(
-        rust_mqtt::client::client_config::MqttVersion::MQTTv5,
-        CountingRng(20000),
-    );
-    config.add_max_subscribe_qos(rust_mqtt::packet::v5::publish_packet::QualityOfService::QoS1);
-    config.add_client_id("clientId-8rhWgBODCl");
-    config.add_will("device/1/status", "DISCONNECTED".as_bytes(), true);
-    config.max_packet_size = 100;
-    let mut recv_buffer = [0; 80];
-    let mut write_buffer = [0; 80];
+    // if let Err(e) = connection {
+    //     info!("connect error: {:?}", e);
+    // }
+    // info!("connected!");
 
-    let mut client =
-        MqttClient::<_, 5, _>::new(socket, &mut write_buffer, 80, &mut recv_buffer, 80, config);
+    // let mut config = ClientConfig::new(
+    //     rust_mqtt::client::client_config::MqttVersion::MQTTv5,
+    //     CountingRng(20000),
+    // );
+    // config.add_max_subscribe_qos(rust_mqtt::packet::v5::publish_packet::QualityOfService::QoS1);
+    // config.add_client_id("clientId-8rhWgBODCl");
+    // config.add_will("device/1/status", "DISCONNECTED".as_bytes(), true);
+    // config.max_packet_size = 100;
+    // let mut recv_buffer = [0; 80];
+    // let mut write_buffer = [0; 80];
 
-    match client.connect_to_broker().await {
-        Ok(()) => {}
-        Err(mqtt_error) => match mqtt_error {
-            ReasonCode::NetworkError => {
-                info!("MQTT Network Error");
-            }
-        ReasonCode::Success => {
-                info!("Success");
-            }
-            _ => {
-                info!("Another Error");
-            }
-        },
-    }
+    // let mut client =
+    //     MqttClient::<_, 5, _>::new(socket, &mut write_buffer, 80, &mut recv_buffer, 80, config);
 
-    match client
-    .send_message(
-        "device/1/status",
-        "CONNECTED".as_bytes(),
-        rust_mqtt::packet::v5::publish_packet::QualityOfService::QoS0,
-        true,
-    )
-    .await
-{
-    Ok(()) => {}
-    Err(mqtt_error) => match mqtt_error {
-        ReasonCode::NetworkError => {
-            info!("MQTT Network Error");
-        }
-        _ => {
-            info!("Error while sending message");
-        }
-    },
-}
+    // match client.connect_to_broker().await {
+    //     Ok(()) => {}
+    //     Err(mqtt_error) => match mqtt_error {
+    //         ReasonCode::NetworkError => {
+    //             info!("MQTT Network Error");
+    //         }
+    //     ReasonCode::Success => {
+    //             info!("Success");
+    //         }
+    //         _ => {
+    //             info!("Another Error");
+    //         }
+    //     },
+    // }
+
+    demo_device.init().await;
 
     // The main loop for the device
     loop {
-        if !COMMAND_CHANNEL.is_empty() {
-            let command_result = COMMAND_CHANNEL.receive().await;
-            let command = match command_result {
-                Ok(command) => command,
-                Err(err_msg) => {
-                    let mut error_msg: String<64> = String::new();
-                    error_msg.push_str("[ERR] ").unwrap();
-                    error_msg.push_str(err_msg).unwrap();
-                    error_msg.push_str("\n").unwrap();
-                    sender.write_packet(error_msg.as_bytes()).await.unwrap();
-                    continue;
-                }
-            };
+       demo_device.run().await;
 
-            let exec_result = demo_device.execute_command(command).await;
+        // if demo_device.get_config().is_none() {
+        //     Timer::after_millis(1000).await;
+        //     info!("Waiting for config");
+        //     continue;
+        // }
 
-            match exec_result {
-                Ok(msg) => {
-                    let mut success_msg: String<64> = String::new();
-                    success_msg.push_str("[OK] ").unwrap();
-                    success_msg.push_str(msg.as_str()).unwrap();
-                    success_msg.push_str("\n").unwrap();
-                    sender.write_packet(success_msg.as_bytes()).await.unwrap()
-                }
-                Err(err_msg) => {
-                    let mut error_msg: String<64> = String::new();
-                    error_msg.push_str("[ERR] ").unwrap();
-                    error_msg.push_str(err_msg).unwrap();
-                    error_msg.push_str("\n").unwrap();
-                    sender.write_packet(error_msg.as_bytes()).await.unwrap()
-                }
-            }
-        }
+        // Timer::after_millis(100).await;
 
-        if demo_device.get_config().is_none() {
-            Timer::after_millis(1000).await;
-            info!("Waiting for config");
-            continue;
-        }
+        // let state_json = demo_device.get_state_json().unwrap();
 
-        Timer::after_millis(100).await;
-        let raw_temp = adc.read(&mut ts).await.unwrap();
-        let temp_c = convert_to_celsius(raw_temp);
-        demo_device.set_temperature(temp_c);
+        // let mut topic: String<64> = String::new(); // Fixed capacity of 64 bytes
 
-        info!("Temperature: {} C", temp_c);
-
-        let state_json = demo_device.get_state_json().unwrap();
-
-        let mut topic: String<64> = String::new(); // Fixed capacity of 64 bytes
-
-        write!(topic, "device/{}/state", "1").unwrap();
+        // write!(topic, "device/{}/state", "1").unwrap();
         
         
-        match client
-            .send_message(
-                topic.as_str(),
-                state_json.as_bytes(),
-                rust_mqtt::packet::v5::publish_packet::QualityOfService::QoS1,
-                true,
-            )
-            .await
-        {
-            Ok(()) => {}
-            Err(mqtt_error) => match mqtt_error {
-                ReasonCode::NetworkError => {
-                    info!("MQTT Network Error");
-                }
-                _ => {
-                    info!("Error while sending message");
-                }
-            },
-        }
+        // match client
+        //     .send_message(
+        //         topic.as_str(),
+        //         state_json.as_bytes(),
+        //         rust_mqtt::packet::v5::publish_packet::QualityOfService::QoS1,
+        //         true,
+        //     )
+        //     .await
+        // {
+        //     Ok(()) => {}
+        //     Err(mqtt_error) => match mqtt_error {
+        //         ReasonCode::NetworkError => {
+        //             info!("MQTT Network Error");
+        //         }
+        //         _ => {
+        //             info!("Error while sending message");
+        //         }
+        //     },
+        // }
     }
 }
 

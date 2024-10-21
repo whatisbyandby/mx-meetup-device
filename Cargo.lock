@@ -1110,13 +1110,31 @@ dependencies = [
 name = "mx-meetup-lib"
 version = "0.1.0"
 dependencies = [
+ "cortex-m",
+ "cortex-m-rt",
  "cyw43",
+ "cyw43-pio",
  "defmt",
+ "defmt-rtt",
+ "embassy-executor",
+ "embassy-futures",
+ "embassy-net",
+ "embassy-net-driver-channel 0.3.0",
+ "embassy-rp",
+ "embassy-sync 0.6.0",
+ "embassy-time",
  "embassy-usb",
+ "embassy-usb-logger",
  "embedded-io-async",
  "heapless 0.8.0",
+ "log",
+ "panic-probe",
+ "portable-atomic",
+ "rand",
+ "rust-mqtt",
  "serde",
  "serde-json-core",
+ "static_cell",
 ]
 
 [[package]]
