@@ -1,8 +1,8 @@
 #![no_std]
 #![no_main]
 
-use core::str::from_utf8;
 use core::fmt::Write;
+use core::str::from_utf8;
 use cyw43_pio::PioSpi;
 use defmt::{info, panic, unwrap};
 use embassy_executor::Spawner;
@@ -12,6 +12,7 @@ use embassy_rp::adc::{
 };
 use embassy_rp::bind_interrupts;
 use embassy_rp::clocks::RoscRng;
+use embassy_rp::flash::{Blocking, Flash};
 use embassy_rp::gpio::{Level, Output};
 use embassy_rp::peripherals::{DMA_CH0, PIO0, USB};
 use embassy_rp::pio::{InterruptHandler as PioInterruptHandler, Pio};
@@ -30,14 +31,11 @@ use heapless::String;
 use mx_meetup_lib::{parse_command, DemoDevice, DemoDeviceBuilder, DeviceState, PicoCommand};
 use rust_mqtt::client::client::MqttClient;
 use rust_mqtt::client::client_config::ClientConfig;
-use rust_mqtt::packet::v5::reason_codes::ReasonCode;
 use rust_mqtt::utils::rng_generator::CountingRng;
 use static_cell::StaticCell;
 use {defmt_rtt as _, panic_probe as _};
 
 use mx_meetup_lib::temperature_sensor::{BuiltInTemperatureSensor, TemperatureSensor};
-
-
 
 bind_interrupts!(struct UsbIrqs {
     USBCTRL_IRQ => UsbInterruptHandler<USB>;
@@ -54,10 +52,8 @@ bind_interrupts!(struct PioIrqs {
 use embassy_sync::blocking_mutex::raw::ThreadModeRawMutex;
 use embassy_sync::channel::{Channel as SyncChannel, Sender};
 
-static COMMAND_CHANNEL: SyncChannel<ThreadModeRawMutex, Result<PicoCommand, &'static str>, 64> =
+static COMMAND_CHANNEL: SyncChannel<ThreadModeRawMutex, Result<PicoCommand, &'static str>, 5> =
     SyncChannel::new();
-
-
 
 #[embassy_executor::task]
 async fn command_task(mut receiver: Receiver<'static, Driver<'static, USB>>) {
@@ -80,11 +76,30 @@ async fn net_task(stack: &'static Stack<D<'static, 1514>>) -> ! {
     stack.run().await
 }
 
+const FLASH_SIZE: usize = 2 * 1024 * 1024;
+
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
     let p = embassy_rp::init(Default::default());
 
     let mut rng = RoscRng;
+
+    let mut flash = embassy_rp::flash::Flash::<_, Blocking, FLASH_SIZE>::new_blocking(p.FLASH);
+
+    let mut uid = [0; 8];
+    flash.blocking_unique_id(&mut uid).unwrap();
+    let mut id_string = String::<16>::new();
+    write!(
+        id_string,
+        "{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}",
+        uid[0], uid[1], uid[2], uid[3], uid[4], uid[5], uid[6], uid[7]
+    )
+    .unwrap();
+
+    static ID_STRING: StaticCell<String<16>> = StaticCell::new();
+    let static_id = ID_STRING.init(id_string);
+
+    // Get unique id
 
     let fw = include_bytes!("../../pico-w-cyw43/cyw43-firmware/43439A0.bin");
     let clm = include_bytes!("../../pico-w-cyw43/cyw43-firmware/43439A0_clm.bin");
@@ -108,7 +123,7 @@ async fn main(spawner: Spawner) {
     unwrap!(spawner.spawn(cyw43_task(runner)));
 
     control.init(clm).await;
-   
+
     let config = NetConfig::dhcpv4(Default::default());
 
     // Generate random seed
@@ -126,7 +141,9 @@ async fn main(spawner: Spawner) {
     static STACK: StaticCell<Stack<D<'static, 1514>>> = StaticCell::new();
     let static_stack = STACK.init(stack);
 
-    
+ 
+
+    // client.connect_to_broker().await.unwrap();
 
     // Create the driver, from the HAL.
     let driver = Driver::new(p.USB, UsbIrqs);
@@ -140,7 +157,7 @@ async fn main(spawner: Spawner) {
         let mut config = embassy_usb::Config::new(0xc0de, 0xcafe);
         config.manufacturer = Some("Paradigm");
         config.product = Some("Mx Meetup Demo Device");
-        config.serial_number = Some("12345678");
+        config.serial_number = Some(&static_id.as_str());
         config.max_power = 100;
         config.max_packet_size_0 = 64;
 
@@ -190,9 +207,15 @@ async fn main(spawner: Spawner) {
     // Run the command task.
     unwrap!(spawner.spawn(command_task(receiver)));
 
-    let command_receiver: embassy_sync::channel::Receiver<'_, ThreadModeRawMutex, Result<PicoCommand, &str>, 64> = COMMAND_CHANNEL.receiver();
+    let command_receiver: embassy_sync::channel::Receiver<
+        '_,
+        ThreadModeRawMutex,
+        Result<PicoCommand, &str>,
+        5,
+    > = COMMAND_CHANNEL.receiver();
 
     let mut demo_device = DemoDeviceBuilder::new()
+        .with_id(static_id)
         .with_stack(static_stack)
         .with_command_receiver(command_receiver)
         .with_usb_sender(sender)
@@ -200,93 +223,14 @@ async fn main(spawner: Spawner) {
         .with_adc(adc, ts)
         .build();
 
-
-    // let mut rx_buffer = [0; 4096];
-    // let mut tx_buffer = [0; 4096];
-
-    // let mut socket = TcpSocket::new(static_stack, &mut rx_buffer, &mut tx_buffer);
-
-    // socket.set_timeout(None);
-
-    // let address = Ipv4Address::from_bytes(&[192, 168, 1, 89]);
-    // let remote_endpoint = (address, 1883);
-
-    // let connection = socket.connect(remote_endpoint).await;
-
-    // if let Err(e) = connection {
-    //     info!("connect error: {:?}", e);
-    // }
-    // info!("connected!");
-
-    // let mut config = ClientConfig::new(
-    //     rust_mqtt::client::client_config::MqttVersion::MQTTv5,
-    //     CountingRng(20000),
-    // );
-    // config.add_max_subscribe_qos(rust_mqtt::packet::v5::publish_packet::QualityOfService::QoS1);
-    // config.add_client_id("clientId-8rhWgBODCl");
-    // config.add_will("device/1/status", "DISCONNECTED".as_bytes(), true);
-    // config.max_packet_size = 100;
-    // let mut recv_buffer = [0; 80];
-    // let mut write_buffer = [0; 80];
-
-    // let mut client =
-    //     MqttClient::<_, 5, _>::new(socket, &mut write_buffer, 80, &mut recv_buffer, 80, config);
-
-    // match client.connect_to_broker().await {
-    //     Ok(()) => {}
-    //     Err(mqtt_error) => match mqtt_error {
-    //         ReasonCode::NetworkError => {
-    //             info!("MQTT Network Error");
-    //         }
-    //     ReasonCode::Success => {
-    //             info!("Success");
-    //         }
-    //         _ => {
-    //             info!("Another Error");
-    //         }
-    //     },
-    // }
-
     demo_device.init().await;
+
+    info!("Device Initalized!");
 
     // The main loop for the device
     loop {
-       demo_device.run().await;
-
-        // if demo_device.get_config().is_none() {
-        //     Timer::after_millis(1000).await;
-        //     info!("Waiting for config");
-        //     continue;
-        // }
-
-        // Timer::after_millis(100).await;
-
-        // let state_json = demo_device.get_state_json().unwrap();
-
-        // let mut topic: String<64> = String::new(); // Fixed capacity of 64 bytes
-
-        // write!(topic, "device/{}/state", "1").unwrap();
-        
-        
-        // match client
-        //     .send_message(
-        //         topic.as_str(),
-        //         state_json.as_bytes(),
-        //         rust_mqtt::packet::v5::publish_packet::QualityOfService::QoS1,
-        //         true,
-        //     )
-        //     .await
-        // {
-        //     Ok(()) => {}
-        //     Err(mqtt_error) => match mqtt_error {
-        //         ReasonCode::NetworkError => {
-        //             info!("MQTT Network Error");
-        //         }
-        //         _ => {
-        //             info!("Error while sending message");
-        //         }
-        //     },
-        // }
+        demo_device.run().await;
+        Timer::after_millis(100).await;
     }
 }
 
