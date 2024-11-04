@@ -6,7 +6,6 @@ use core::str::from_utf8;
 use cyw43_pio::PioSpi;
 use defmt::{info, panic, unwrap};
 use embassy_executor::Spawner;
-use embassy_net::tcp::TcpSocket;
 use embassy_rp::adc::{
     Adc, Channel as AdcChannel, Config, InterruptHandler as AdcInterruptHandler,
 };
@@ -17,25 +16,20 @@ use embassy_rp::gpio::{Level, Output};
 use embassy_rp::peripherals::{DMA_CH0, PIO0, USB};
 use embassy_rp::pio::{InterruptHandler as PioInterruptHandler, Pio};
 use embassy_rp::usb::{Driver, Instance, InterruptHandler as UsbInterruptHandler};
-use embassy_time::Timer;
 use embassy_usb::class::cdc_acm::{CdcAcmClass, Receiver, State};
 use embassy_usb::driver::EndpointError;
 use embassy_usb::UsbDevice;
+use embassy_rp::watchdog::Watchdog;
 
-use embassy_net::{Config as NetConfig, Ipv4Address, Stack, StackResources};
+use embassy_net::{Config as NetConfig, Stack, StackResources};
 use embassy_net_driver_channel::Device as D;
 
 use rand::RngCore;
 
 use heapless::String;
-use mx_meetup_lib::{parse_command, DemoDevice, DemoDeviceBuilder, DeviceState, PicoCommand};
-use rust_mqtt::client::client::MqttClient;
-use rust_mqtt::client::client_config::ClientConfig;
-use rust_mqtt::utils::rng_generator::CountingRng;
+use mx_meetup_lib::{parse_command, DemoDeviceBuilder, PicoCommand};
 use static_cell::StaticCell;
 use {defmt_rtt as _, panic_probe as _};
-
-use mx_meetup_lib::temperature_sensor::{BuiltInTemperatureSensor, TemperatureSensor};
 
 bind_interrupts!(struct UsbIrqs {
     USBCTRL_IRQ => UsbInterruptHandler<USB>;
@@ -81,6 +75,8 @@ const FLASH_SIZE: usize = 2 * 1024 * 1024;
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
     let p = embassy_rp::init(Default::default());
+
+    let watchdog = Watchdog::new(p.WATCHDOG);
 
     let mut rng = RoscRng;
 
@@ -140,10 +136,6 @@ async fn main(spawner: Spawner) {
 
     static STACK: StaticCell<Stack<D<'static, 1514>>> = StaticCell::new();
     let static_stack = STACK.init(stack);
-
- 
-
-    // client.connect_to_broker().await.unwrap();
 
     // Create the driver, from the HAL.
     let driver = Driver::new(p.USB, UsbIrqs);
@@ -221,17 +213,14 @@ async fn main(spawner: Spawner) {
         .with_usb_sender(sender)
         .with_control(control)
         .with_adc(adc, ts)
+        .with_watchdog(watchdog)
         .build();
 
     demo_device.init().await;
 
     info!("Device Initalized!");
 
-    // The main loop for the device
-    loop {
-        demo_device.run().await;
-        Timer::after_millis(100).await;
-    }
+    demo_device.run().await;
 }
 
 type MyUsbDriver = Driver<'static, USB>;
