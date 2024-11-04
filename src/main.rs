@@ -26,7 +26,7 @@ use embassy_net_driver_channel::Device as D;
 
 use rand::RngCore;
 
-use heapless::String;
+// use heapless::String;
 use mx_meetup_lib::{parse_command, DemoDeviceBuilder, PicoCommand};
 use static_cell::StaticCell;
 use {defmt_rtt as _, panic_probe as _};
@@ -84,7 +84,7 @@ async fn main(spawner: Spawner) {
 
     let mut uid = [0; 8];
     flash.blocking_unique_id(&mut uid).unwrap();
-    let mut id_string = String::<16>::new();
+    let mut id_string = heapless::String::<16>::new();
     write!(
         id_string,
         "{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}",
@@ -92,7 +92,7 @@ async fn main(spawner: Spawner) {
     )
     .unwrap();
 
-    static ID_STRING: StaticCell<String<16>> = StaticCell::new();
+    static ID_STRING: StaticCell<heapless::String<16>> = StaticCell::new();
     let static_id = ID_STRING.init(id_string);
 
     // Get unique id
@@ -214,6 +214,7 @@ async fn main(spawner: Spawner) {
         .with_control(control)
         .with_adc(adc, ts)
         .with_watchdog(watchdog)
+        .with_flash(flash)
         .build();
 
     demo_device.init().await;
@@ -245,7 +246,7 @@ impl From<EndpointError> for Disconnected {
 async fn get_command<'d, T: Instance + 'd>(
     class: &mut Receiver<'d, Driver<'d, T>>,
 ) -> Result<PicoCommand, &'static str> {
-    let mut full_data: String<256> = String::new();
+    let mut full_data: heapless::String<256> = heapless::String::new();
     let mut done = false;
     while !done {
         let mut buf = [0; 64];
