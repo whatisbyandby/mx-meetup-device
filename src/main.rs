@@ -2,27 +2,28 @@
 #![no_main]
 
 use core::fmt::Write;
+use core::str;
 use core::str::from_utf8;
 use cyw43_pio::PioSpi;
 use defmt::{info, panic, unwrap};
 use embassy_executor::Spawner;
+use embassy_futures::join::join;
+use embassy_net::{Config as NetConfig, Stack, StackResources};
+use embassy_net_driver_channel::Device as D;
 use embassy_rp::adc::{
     Adc, Channel as AdcChannel, Config, InterruptHandler as AdcInterruptHandler,
 };
 use embassy_rp::bind_interrupts;
 use embassy_rp::clocks::RoscRng;
-use embassy_rp::flash::{Blocking, Flash};
+use embassy_rp::flash::Blocking;
 use embassy_rp::gpio::{Level, Output};
 use embassy_rp::peripherals::{DMA_CH0, PIO0, USB};
 use embassy_rp::pio::{InterruptHandler as PioInterruptHandler, Pio};
-
 use embassy_rp::usb::{Driver, InterruptHandler as UsbInterruptHandler};
 use embassy_rp::watchdog::Watchdog;
-use embassy_rp::rom_data::reset_to_usb_boot;
-use embassy_net::{Config as NetConfig, Stack, StackResources};
-use embassy_net_driver_channel::Device as D;
+use embassy_usb::class::cdc_acm::{CdcAcmClass, State};
+use embassy_usb::{Builder, Config as UsbConfig};
 use embassy_usb_logger::ReceiverHandler;
-use core::str;
 
 use rand::RngCore;
 
@@ -44,19 +45,10 @@ bind_interrupts!(struct PioIrqs {
 });
 
 use embassy_sync::blocking_mutex::raw::ThreadModeRawMutex;
-use embassy_sync::channel::{Channel as SyncChannel, Sender};
+use embassy_sync::channel::Channel as SyncChannel;
 
 static COMMAND_CHANNEL: SyncChannel<ThreadModeRawMutex, Result<PicoCommand, &'static str>, 5> =
     SyncChannel::new();
-
-// #[embassy_executor::task]
-// async fn command_task(mut receiver: Receiver<'static, Driver<'static, USB>>) {
-//     receiver.wait_connection().await;
-//     loop {
-//         let command = get_command(&mut receiver).await;
-//         COMMAND_CHANNEL.send(command).await;
-//     }
-// }
 
 #[embassy_executor::task]
 async fn cyw43_task(
@@ -96,7 +88,6 @@ async fn main(spawner: Spawner) {
     let static_id = ID_STRING.init(id_string);
 
     // Get unique id
-
     let fw = include_bytes!("../../pico-w-cyw43/cyw43-firmware/43439A0.bin");
     let clm = include_bytes!("../../pico-w-cyw43/cyw43-firmware/43439A0_clm.bin");
 
@@ -144,10 +135,6 @@ async fn main(spawner: Spawner) {
     // Create the ADC and the temperature sensor channel.
     let adc = Adc::new(p.ADC, AdcIrqs, Config::default());
     let ts = AdcChannel::new_temp_sensor(p.ADC_TEMP_SENSOR);
-   
-
-    log::info!("Starting up!");
-
 
     // Run the network stack.
     unwrap!(spawner.spawn(net_task(static_stack)));
@@ -171,7 +158,7 @@ async fn main(spawner: Spawner) {
 
     demo_device.init().await;
 
-    log::info!("Device Initalized!");
+    info!("Device Initalized!");
 
     demo_device.run().await;
 }
@@ -183,16 +170,12 @@ impl ReceiverHandler for Handler {
         if let Ok(data) = str::from_utf8(data) {
             let data = data.trim();
 
-            // If you are using elf2uf2-term with the '-t' flag, then when closing the serial monitor,
-            // this will automatically put the pico into boot mode
-            if data == "q" || data == "elf2uf2-term" {
-                log::info!("Resetting to USB boot mode");
-                reset_to_usb_boot(0, 0); // Restart the chip
-            } else if data.eq_ignore_ascii_case("hello") {
-                log::info!("World!");
-            } else {
-                log::info!("Recieved: {:?}", data);
-            }
+            let mut full_data: heapless::String<256> = heapless::String::new();
+            full_data.push_str(data).unwrap();
+
+            let command = parse_command(full_data);
+
+            COMMAND_CHANNEL.send(command).await;
         }
     }
 
@@ -203,29 +186,54 @@ impl ReceiverHandler for Handler {
 
 #[embassy_executor::task]
 async fn logger_task(driver: Driver<'static, USB>) {
-    embassy_usb_logger::run!(1024, log::LevelFilter::Info, driver, Handler);
+    // Create embassy-usb Config
+    let mut config = UsbConfig::new(0xc0de, 0xcafe);
+    config.manufacturer = Some("Paradigm");
+    config.product = Some("Demo Device");
+    config.serial_number = Some("12345678");
+    config.max_power = 100;
+    config.max_packet_size_0 = 64;
+
+    // Required for windows compatibility.
+    // https://developer.nordicsemi.com/nRF_Connect_SDK/doc/1.9.1/kconfig/CONFIG_CDC_ACM_IAD.html#help
+    config.device_class = 0xEF;
+    config.device_sub_class = 0x02;
+    config.device_protocol = 0x01;
+    config.composite_with_iads = true;
+
+    // Create embassy-usb DeviceBuilder using the driver and config.
+    // It needs some buffers for building the descriptors.
+    let mut config_descriptor = [0; 256];
+    let mut bos_descriptor = [0; 256];
+    let mut control_buf = [0; 64];
+
+    let mut logger_state = State::new();
+
+    let mut builder = Builder::new(
+        driver,
+        config,
+        &mut config_descriptor,
+        &mut bos_descriptor,
+        &mut [], // no msos descriptors
+        &mut control_buf,
+    );
+
+    // Create classes on the builder.
+    let class = CdcAcmClass::new(&mut builder, &mut logger_state, 64);
+    let log_fut = embassy_usb_logger::with_custom_style!(
+        1024,
+        log::LevelFilter::Info,
+        class,
+        |record, writer| {
+            use core::fmt::Write;
+            let level = record.level().as_str();
+            write!(writer, "[{level}] {}\r\n", record.args()).unwrap();
+        },
+        Handler
+    );
+
+    let mut usb = builder.build();
+    let usb_fut = usb.run();
+    join(usb_fut, log_fut).await;
+    
 }
-
-
-
-// async fn get_command<'d, T: Instance + 'd>(
-//     class: &mut Receiver<'d, Driver<'d, T>>,
-// ) -> Result<PicoCommand, &'static str> {
-//     let mut full_data: heapless::String<256> = heapless::String::new();
-//     let mut done = false;
-//     while !done {
-//         let mut buf = [0; 64];
-//         let num_chars_read = class.read_packet(&mut buf).await.unwrap();
-//         let packet_data = &buf[..num_chars_read];
-//         full_data
-//             .push_str(from_utf8(packet_data).unwrap())
-//             .map_err(|_| "Command contains non-UTF characters")?;
-//         info!("{}", full_data.as_str());
-//         if num_chars_read < 64 {
-//             done = true;
-//         }
-//     }
-
-//     let command = parse_command(full_data)?;
-//     Ok(command)
-// }
