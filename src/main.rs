@@ -1,6 +1,7 @@
 #![no_std]
 #![no_main]
 
+use core::cell::RefCell;
 use core::fmt::Write;
 use core::str;
 use core::str::from_utf8;
@@ -21,6 +22,7 @@ use embassy_rp::peripherals::{DMA_CH0, PIO0, USB};
 use embassy_rp::pio::{InterruptHandler as PioInterruptHandler, Pio};
 use embassy_rp::usb::{Driver, InterruptHandler as UsbInterruptHandler};
 use embassy_rp::watchdog::Watchdog;
+use embassy_sync::blocking_mutex::Mutex;
 use embassy_usb::class::cdc_acm::{CdcAcmClass, State};
 use embassy_usb::{Builder, Config as UsbConfig};
 use embassy_usb_logger::ReceiverHandler;
@@ -44,7 +46,7 @@ bind_interrupts!(struct PioIrqs {
     PIO0_IRQ_0 => PioInterruptHandler<PIO0>;
 });
 
-use embassy_sync::blocking_mutex::raw::ThreadModeRawMutex;
+use embassy_sync::blocking_mutex::raw::{NoopRawMutex, ThreadModeRawMutex};
 use embassy_sync::channel::Channel as SyncChannel;
 
 static COMMAND_CHANNEL: SyncChannel<ThreadModeRawMutex, Result<PicoCommand, &'static str>, 5> =
@@ -163,19 +165,22 @@ async fn main(spawner: Spawner) {
     demo_device.run().await;
 }
 
+static mut COMMAND_STRING: heapless::String<256> = heapless::String::<256>::new();
+
 struct Handler;
 
 impl ReceiverHandler for Handler {
     async fn handle_data(&self, data: &[u8]) {
-        if let Ok(data) = str::from_utf8(data) {
-            let data = data.trim();
-
-            let mut full_data: heapless::String<256> = heapless::String::new();
-            full_data.push_str(data).unwrap();
-
-            let command = parse_command(full_data);
-
-            COMMAND_CHANNEL.send(command).await;
+        // Convert the incoming data to a UTF-8 string
+        if let Ok(data_str) = str::from_utf8(data) {
+            unsafe {
+                COMMAND_STRING.push_str(data_str.trim()).unwrap();
+                if data_str.ends_with("\r\n") || data_str.ends_with("\n") {
+                    let command = parse_command(COMMAND_STRING.clone());
+                    COMMAND_CHANNEL.send(command).await;
+                    COMMAND_STRING.clear();
+                }
+            }
         }
     }
 
@@ -183,6 +188,7 @@ impl ReceiverHandler for Handler {
         Self
     }
 }
+
 
 #[embassy_executor::task]
 async fn logger_task(driver: Driver<'static, USB>) {
