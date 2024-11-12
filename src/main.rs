@@ -1,10 +1,8 @@
 #![no_std]
 #![no_main]
 
-use core::cell::RefCell;
 use core::fmt::Write;
 use core::str;
-use core::str::from_utf8;
 use cyw43_pio::PioSpi;
 use defmt::{info, panic, unwrap};
 use embassy_executor::Spawner;
@@ -22,7 +20,7 @@ use embassy_rp::peripherals::{DMA_CH0, PIO0, USB};
 use embassy_rp::pio::{InterruptHandler as PioInterruptHandler, Pio};
 use embassy_rp::usb::{Driver, InterruptHandler as UsbInterruptHandler};
 use embassy_rp::watchdog::Watchdog;
-use embassy_sync::blocking_mutex::Mutex;
+use embassy_time::{TimeoutError, Timer};
 use embassy_usb::class::cdc_acm::{CdcAcmClass, State};
 use embassy_usb::{Builder, Config as UsbConfig};
 use embassy_usb_logger::ReceiverHandler;
@@ -68,7 +66,7 @@ const FLASH_SIZE: usize = 2 * 1024 * 1024;
 
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
-    let p = embassy_rp::init(Default::default());
+    let mut p = embassy_rp::init(Default::default());
 
     let watchdog = Watchdog::new(p.WATCHDOG);
 
@@ -160,9 +158,16 @@ async fn main(spawner: Spawner) {
 
     demo_device.init().await;
 
-    info!("Device Initalized!");
+    loop {
+        demo_device.run().await;
+        if p.BOOTSEL.is_pressed() {
+            info!("Toggling LED");
+            // COMMAND_CHANNEL.send(Ok(PicoCommand::Led(mx_meetup_lib::LedCommandParameter::Toggle))).await;
+            demo_device.set_led(mx_meetup_lib::LedCommandParameter::Toggle).await;
+            Timer::after_millis(500).await;
+        }
+    }
 
-    demo_device.run().await;
 }
 
 static mut COMMAND_STRING: heapless::String<256> = heapless::String::<256>::new();
